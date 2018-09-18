@@ -1,0 +1,357 @@
+---
+title: "A Brief Introduction to Quantitative Trading and the Quanstrat Library"
+author: "Dhiraj Amarnani"
+date: "November 29, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction: Package Set-Up & Backtesting 
+
+We first start off by loading up all the necessary packages to use below. Since the packages are still under heavy development, we need to download them off the authors github repository as opposed to CRAN. 
+```{r, message = FALSE}
+if (!require("TTR")) {
+  install.packages("TTR")
+  library(TTR)
+}
+if (!require("quantstrat")) {
+  if(!require("devtools")) {
+    install.packages("devtools")
+    require(devtools)
+  }
+  install_github("braverock/blotter") # dependency
+  install_github("braverock/quantstrat")
+}
+
+if (!require("IKTrading")){
+  install_github("IlyaKipnis/IKTrading", force=TRUE)
+}
+
+library(devtools)
+library(quantmod)
+library(quantstrat)
+library(TTR)
+library(png)
+library(IKTrading)
+```
+
+The quanstrat package provides a flexible framework that allows quantitative trading strategy backtesting. What is a backtest you might ask? The goal of a backtest is to define a set of mechanisms for entry and exit (buy/sell) for a pre-defined portfolio of assets (such as stocks, currencies, bonds, commodities), and apply these mechanisms or rules to historical prices in an attempt to analyze performance of this strategy. 
+
+> "All models are wrong but some can be useful"
+
+Rather than backtests being used to validate good trading strategies, I think they are better served to reject those strategies we definitely **DO NOT** want to use. 
+
+Below I provide an image that I think provides an appropriate high-level overview of how the quantstrat library provides their backtesting framework.
+
+```{r}
+img1_path <- "/Users/28422/Desktop/obmodel.png"
+img1 <- readPNG(img1_path, native = TRUE, info = TRUE)
+knitr::include_graphics(img1_path)
+```
+
+
+Essentially, the framework can be broken up into the following components:
+
+  - The instruments contain market data (the time series of asset prices)
+  - The indicators are 'features' derived from the market data (feature extraction)
+  - Signals are generated through interactions between the indicators and market data
+  - Rules use the signals to generate buy/sell orders
+  - The interaction between rules and orders generates transactions
+  
+Before starting I wanted to address a few topics that are important to keep in mind when conducting any sort of backtest that I believe arent addressed as often as they should be in literature (This is by no means an exhaustive list):
+
+  - **Transaction Costs:** Many academic papers conduct backtests typically free of transaction costs (but it is notoriously easy to find profitable strategies without these costs). Costs to keep in mind are brokerage costs (trading isnt free!), market impact (especially if my strategy is high capacity) and slippage (its rare in practice that orders will get filled at the prevailing market price). 
+  
+  - **Market Regime Changes:** Stock market distributions and parameters are typically non-stationary (or time varying). As a result, defining a fixed parameterized model is likely to inflate backtest performance over live trading results (which is a phenomenon thats been continuously validated both in practice and academia). 
+
+## Part 1: Boiler Plate Set-Up
+
+Now, lets dive right into the library. The first thing we need to do is set up the environment for our strategy, initializing the various moving parts in quantstrat. I display the code and explain what its doing below: 
+```{r, message=FALSE}
+rm(list = ls(.blotter), envir = .blotter)
+
+initdate <- "2010-01-01"
+from <- "2011-01-01" #start of backtest
+to <- "2017-01-01" #end of backtest
+
+Sys.setenv(TZ= "EST") #Set up environment for timestamps
+
+currency("USD") #Set up environment for currency to be used
+
+symbols <- c("AAPL", "MSFT", "GOOG", "FB", "TWTR", "AMZN", "IBM") #symbols used in our backtest
+getSymbols(Symbols = symbols, src = "google", from=from, to=to, adjust = TRUE) #receive data from google finance,  adjusted for splits/dividends
+stock(symbols, currency = "USD", multiplier = 1) #tells quanstrat what instruments present and what currency to use
+
+tradesize <-10000 #default trade size
+initeq <- 100000 #default initial equity in our portfolio
+
+strategy.st <- portfolio.st <- account.st <- "firststrat" #naming strategy, portfolio and account
+
+#removes old portfolio and strategy from environment
+rm.strat(portfolio.st)
+rm.strat(strategy.st) 
+
+#initialize portfolio, account, orders and strategy objects
+initPortf(portfolio.st, symbols = symbols, initDate = initdate, currency = "USD")
+initAcct(account.st, portfolios = portfolio.st, initDate = initdate, currency = "USD", initEq = initeq)
+initOrders(portfolio.st, initDate = initdate)
+strategy(strategy.st, store=TRUE)
+
+
+```
+An account may contain one or more portfolios and each portfolio may contain one or more strategies. In this case we will be working with one of each. If a strategy already exists in working environment, it cannot be re-run so we must remove the already existing strategy as well as portfolio. 
+
+Essentially: We have an account, we have various portfolios in each account which contain assets. Quanstrat needs to initialize orders, a container holding the history of transactions to buy or sell assets. Finally, the strategy is a set of instructions on how to buy or sell these assets. 
+
+
+
+## Part 2: Indicators, Signals, Rules
+
+###Indicators
+
+Market data is noisy and generally prone to toying with both our system and emotions. To gain insights from this data, we need to transform it through indicators (gain smoothness at the expense of a lagged effect typically) which I will describe below. We attempt to paint a clearer picture of asset price movement. 
+
+Indicators fall under two categories:
+
+  - Trend Indicators: The examples we will use are the 200-day and 50-day SMA. It is a basic average of the past n-day of the closing prices. Think about these indicators as smoothed prices. 
+  - Oscillating Indicators: The example we will use is the RSI. These indicators are scaled from 0 to 100, 0 to 1 or values centered around 0. The purpose of such oscillating indicators is typically to identify short term opportunities of temporary price pullbacks, in the expectation of rising prices in the future (or vice versa). 
+  
+The strategy we will analyze today combines a basic moving average cross-over as a filter with an oscillation indicator to enter positions. To get a better idea of what these indicators are, I provide the equations for how to calculate them below as well an example of what these indicators may look like for IBM stock prices. 
+
+SMA(n): n period SMA
+$$ SMA_{n} = (p_1 + p_2 + ... + p_n)/n $$
+
+RSI(n): n period RSI
+$$ 100 - \frac{100}{1+\frac{AvgGain_n}{AvgLoss_n}} $$
+
+
+
+```{r}
+#Plots the 50, 200 day SMA
+candleChart(IBM, up.col = "black", dn.col = "red", theme = "white")
+addSMA(n = c(200,50), on = 1, col = c("red", "blue"))
+
+#Plots the RSI with lookback equal to 10 days 
+plot(RSI(Cl(AMZN), n=10))
+
+```
+
+Next, we look at the function that adds indicators to our strategy. Unsurprisingly, these are called add.indicator(). I provide code below that shows the general structure of these functions and set up the 3 indicators we discussed previously. 
+
+```{r}
+add.indicator(strategy = strategy.st,
+              name = 'SMA',
+              arguments = list(x = quote(Cl(mktdata)), n=200),
+              label = 'SMA200')
+
+add.indicator(strategy = strategy.st,
+              name = 'SMA',
+              arguments = list(x = quote(Cl(mktdata)), n=50),
+              label = 'SMA50')
+
+add.indicator(strategy = strategy.st,
+              name = 'RSI',
+              arguments = list(price = quote(Cl(mktdata)), n=3),
+              label = 'RSI_3')
+
+
+```
+
+And thats all we need to do to set up the indicators for our model, now onto signals. 
+
+###Signals
+
+Signals are interactions of indicators with market data or other indicators. Essentially, they are used to determine when we will buy or sell one of the pre-defined assets in our portfolio. For example, a trend signal may be when a shorter lookback period SMA crosses over a longer lookback period SMA (in our case, the 50-day SMA crosses above the 200-day SMA). One important concept to keep in mind is that a signal is necessary but not sufficient for buy/sell orders. 
+  
+Unlike indicators, the few signal functions found in quantstrat can cover almost all phenomena found in financial trading. There are four types of signals found in quantstrat. 
+
+  - 1. **sigComparison:** Signal continuously comparing two different quantities,     returns a 1 if the relationship is true. 
+  - 2. **sigCrossover:** The same as sigComparison but only returns value of 1 on the first occurence of the relationship changing from false to true. 
+  - 3. **sigThreshold:** Compares a range-bound indicator (like our RSI that oscillated between 0 and 100) to a static (fixed) quantity we define. 
+  - 4. **sigFormula:** Essentially combines 2 or more indicators/signals to form ensemble signals. 
+  
+Below, are two diagrams that represent the behavior of the signals I defined above. We will also see an example of all of these signals used below. 
+```{r}
+img2_path <- "/Users/28422/Desktop/sigcross_sigcomp.png"
+img2 <- readPNG(img2_path, native = TRUE, info = TRUE)
+knitr::include_graphics(img2_path)
+
+img3_path <- "/Users/28422/Desktop/sigthresh.png"
+img3 <- readPNG(img3_path, native = TRUE, info = TRUE)
+knitr::include_graphics(img3_path)
+```
+
+
+
+Finally, let us add these signals to our strategy. This can be seen in the code below:
+
+
+```{r}
+#First Signal: sigComparison specifying when 50-day SMA above 200-day SMA
+add.signal(strategy.st, name = 'sigComparison',
+          arguments = list(columns=c("SMA50", "SMA200")),
+          relationship = "gt",
+          label = "longfilter")
+
+#Second Signal: sigCrossover specifying the first instance when 50-day SMA below 200-day SMA 
+add.signal(strategy.st, name = "sigCrossover",
+           arguments = list(columns=c("SMA50", "SMA200")),
+           relationship = "lt",
+           lablel = "sigCrossover.sig")
+
+#Third Signal: sigThreshold which specifies all instance when RSI is below 20 (indication of asset being oversold)
+add.signal(strategy.st, name = "sigThreshold",
+           arguments = list(column = "RSI_3", threshold = 20,
+                            relationship = "lt", cross = FALSE),
+           label = "longthreshold")
+
+#Fourth Signal: sigThreshold which specifies the first instance when rsi is above 80 (indication of asset being overbought)
+add.signal(strategy.st, name = "sigThreshold",
+           arguments = list(column = "RSI_3", threshold = 80,
+                            relationship = "gt", cross = TRUE),
+           label = "thresholdexit")
+
+#Fifth Signal: sigFormula which indicates that both longfilter and longthreshold must be true.
+add.signal(strategy.st, name = "sigFormula",
+           arguments = list(formula = "longfilter & longthreshold",
+                            cross = TRUE),
+          label = "longentry")
+```
+Those 5 signals are all our strategy needs. Next we will look at how we can use these signals to generate actual buy/sell orders using quantstrat.  
+
+
+###Rules
+
+Rules are essentially functions specifying how we will create our actual transactions once we decide to execute based on one or more of our given signals. Rule customization is quantstrat is far more involved than any of the other objects and most of this customization is beyond the scope of this presentation. 
+
+There are 2 types of rules:
+
+  - Entry: Buy shares
+  - Exit: Sell shares and convert the shares into cash
+  
+Finally, we can also specify a order sizing function with the argument osFUN. I import a osMaxDollar order sizing function from a well known quant and quantstrat enthusiast Ilya Kipnis. It essentially obtains a position equal to the specified trade size of the asset, rounded to the nearest unit of the asset. 
+```{r}
+#The first rule will be an exit rule. This exit rule will execute when the market environment is no longer conducive to a trade (i.e. when the SMA-50 falls below SMA-200)
+add.rule(strategy.st, name = "ruleSignal",
+         arguments = list(sigcol = "sigCrossover.sig", sigval = TRUE,
+                          orderqty = "all", ordertype = "market",
+                          orderside = "long", replace = FALSE,
+                          prefer = "Open"),
+         type = "exit")
+
+#The second rule, similar to the first, executes when the RSI has crossed above 80. 
+add.rule(strategy.st, name = "ruleSignal",
+         arguments = list(sigcol = "thresholdexit", sigval = TRUE,
+                          orderqty = "all", ordertype = "market",
+                          orderside = "long", replace = FALSE,
+                          prefer = "Open"),
+         type = "exit")
+
+#Additionally, we also need an entry rule. This rule executes when longentry is true (or when long filter and longthreshold are true). That is when SMA-50 is above SMA-200 and the RSI is below 20.
+add.rule(strategy.st, name = "ruleSignal",
+         arguments = list(sigcol = "longentry", sigval = TRUE,
+                          orderqty = 1, ordertype = "market",
+                          orderside = "long", replace = FALSE,
+                          prefer = "Open", osFUN = IKTrading::osMaxDollar,
+                          tradeSize = tradesize, maxSize = tradesize),
+         type = "enter")
+
+```
+And that's all we need to do for our rules. Now whats left is to apply these rules over the course of our specified backtest period and analyze the results. 
+
+## Part 3: Performance Analytics
+
+To review, the following is essentially the strategy we have coded up thus far:
+
+  - Buy When: SMA-50 > SMA-200 **AND** the RSI < 20
+  - Sell When: SMA-50 < SMA-200 **OR** RSI > 80
+  
+In order to run our strategy and obtain results, we must first call the applyStrategy() function, update our portfolio and account in that order. After we apply our strategy, we need to call these functions to update R's analytic environment (by first updating our portfolio with transactions our strategy took and then our account and ending equity). We do this in the code below:
+```{r, message=FALSE, results="hide"}
+out <- applyStrategy(strategy = strategy.st, portfolios = portfolio.st)
+updatePortf(portfolio.st)
+daterange <- time(getPortfolio(portfolio.st)$summary)[-1]
+
+updateAcct(account.st, daterange)
+updateEndEq(account.st)
+
+```
+
+Next, we look at all the trade statistics generated. 
+  
+Below I plot the performance of our strategy for each individual security price, with the 50 and 200 day SMA overlaying the price chart. I do this by first creating the functions using the TTR package, storing them and then using the add_TA function to overlay them on my charts. 
+```{r}
+for(symbol in symbols){
+  
+  chart.Posn(Portfolio = portfolio.st, Symbol = symbol, 
+             TA= c("add_SMA(n=50, col='blue')", "add_SMA(n=200, col='red')"))
+}
+
+```
+
+
+I decided to generate a table where we can better look at the trade statistics for our trades. Although this may seem like **ALOT** of statistics, many of them can be useful. However, the few that matter the most in my opinion are the following:
+
+  - Num.Trades: Essentially, our sample size.
+  - Profit Factor: Gross profit / Gross Loss. The amount of profit per unit of risk
+  - Sharpe: risk adjusted returns
+```{r}
+tstats <- tradeStats(Portfolios = portfolio.st)
+
+tstats[, 4:ncol(tstats)] <- round(tstats[, 4:ncol(tstats)],2)
+print(data.frame(t(tstats[,-c(1,2)])))
+```
+
+
+In addition to the trade statistics table, one really useful feature of quantstrat is to look at how our portfolio does through time. We plot this below as well as the cumulative return plots below. 
+```{r}
+final_acct <- getAccount(account.st)
+end_eq <- final_acct$summary$End.Eq
+
+returns <- Return.calculate(end_eq, method="log")
+charts.PerformanceSummary(returns, colorset = bluefocus, main = "Strategy Performance")
+
+```
+
+
+Finally, another very interesting functionality is being able to plot cumulative returns for each individual asset. Many of these functionalities are in the PerformanceAnalytics package. 
+
+```{r, results = "hide"}
+returns_2 <- PortfReturns(account.st)
+colnames(returns_2) <- symbols
+returns_2 <- na.omit(cbind(returns_2,Return.calculate(end_eq)))
+names(returns_2)[length(names(returns_2))] <- "Total"
+returns_2 <- returns_2[,c("Total", symbols)]
+round(tail(returns_2,5),6)
+
+chart.CumReturns(returns_2, colorset = rich10equal, legend.loc = "topleft", main = "Strategy Cumulative Returns")
+
+chart.Boxplot(returns_2, main = "Strategy Returns", colorset = rich10equal)
+```
+
+## Conclusions and Further Considerations 
+Finally, I wanted to briefly talk about how we would test our trading system and its robustness. What are a few ways I could test how robust my model is? One way is out-of-sample testing which may seem like an excellent idea at first (since we've been doing it this entire semester). This would typically be done by optimizing our parameters over the backtest (training) period and applying it to a different out-of-sample period (validation).
+
+But, this can fail/mislead us for a number of reasons:
+
+Most financial data out there is very sparse (that is, contains very few observations). Therefore, if I backtest a low-frequency strategy, I just dont have enough data points to make any sort of statistically significant claim about my out-of-sample performance. So it begs the question, how do I know my strategy isnt overfit or spurious in its returns?:
+
+> I don't. And neither do alot of other professional traders (Who said trading was easy?)
+
+**BUT** we can use other methods to try and rectify this issue. I discuss two main ways below (although there are a multitude more ways being explored in literature and practice):
+  
+  - Upsampling or oversampling can be used on financial data (but must be done very carefully because of regime shifts).
+  - Parameter Sensitivity/Stability Testing: Essentially, if I decide to use different parameters for my technical indicators (like a SMA-30 and SMA-180) or start on different days of the week, do my performance results vary greatly (how fragile is my model based on its starting conditions?)
+  
+The field of quant trading is extremely messy. Many professional quantitative analysts however have blogs that discuss many of these issues at length. The following are among my favorites:
+
+  - [Michael Halls-Moore](https://www.quantstart.com/articles)
+  - [Ernie Chan](http://epchan.blogspot.co.id/)
+  - [Jonathan Kinlay](http://jonathankinlay.com/)
+  - [Cesar Alvarez](http://alvarezquanttrading.com/)
+  - [Rob Carver](https://qoppac.blogspot.co.at/)
+
+
